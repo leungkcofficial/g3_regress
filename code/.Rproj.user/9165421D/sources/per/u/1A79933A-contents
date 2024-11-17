@@ -1,0 +1,92 @@
+library(rhdf5)
+library(dplyr)
+library(tidyr)
+library(recipes)
+library(caret)
+library(purrr)
+
+# Custom functions
+row_filter <- function(data, column, condition) {
+  data <- data %>% filter(condition(.data[[column]]))
+  return(data)
+}
+
+log_transformer <- function(data, offset = 1e-6) {
+  data <- data %>% mutate(across(where(is.numeric), ~log(. + offset)))
+  return(data)
+}
+
+shuffle_data <- function(data) {
+  data <- data[sample(nrow(data)), ]
+  return(data)
+}
+
+read_imputed_datasets_hdf5 <- function(base_filename) {
+  datasets <- list()
+  h5_file <- paste0(base_filename, ".h5")
+  
+  keys <- h5ls(h5_file)$name
+  for (key in keys) {
+    parts <- unlist(strsplit(key, "/"))
+    estimator_name <- parts[1]
+    dataset_name <- paste(parts[-1], collapse = "/")
+    if (!is.list(datasets[[estimator_name]])) {
+      datasets[[estimator_name]] <- list()
+    }
+    datasets[[estimator_name]][[dataset_name]] <- as.data.frame(h5read(h5_file, key))
+  }
+  
+  return(datasets)
+}
+
+create_pipeline <- function(cat_features, log_features, standard_features, passthrough_features) {
+  function(data) {
+    # Imputation (using median for simplicity)
+    data <- data %>% mutate(across(all_of(cat_features), ~ifelse(is.na(.), "missing", .)))
+    data <- data %>% mutate(across(all_of(c(log_features, standard_features)), ~ifelse(is.na(.), median(., na.rm = TRUE), .)))
+    
+    # Log transformation
+    data <- log_transformer(data)
+    
+    # Scaling (using caret's preprocessing)
+    preprocess <- preProcess(data, method = c("center", "scale"))
+    data <- predict(preprocess, data)
+    
+    # Filtering rows
+    data <- row_filter(data, "date_from_sub_60", function(x) x <= 1825)
+    
+    # Shuffle data
+    data <- shuffle_data(data)
+    
+    return(data)
+  }
+}
+
+load_and_transform_data <- function(base_filename, cat_features, log_features, standard_features, passthrough_features) {
+  datasets <- read_imputed_datasets_hdf5(base_filename)
+  
+  X_train <- datasets$X_train_main[[1]]
+  X_test <- datasets$X_test_main[[1]]
+  
+  pipeline <- create_pipeline(cat_features, log_features, standard_features, passthrough_features)
+  
+  X_train_transformed <- pipeline(X_train)
+  X_test_transformed <- pipeline(X_test)
+  
+  return(list(X_train_transformed = X_train_transformed, X_test_transformed = X_test_transformed))
+}
+
+# Define feature categories
+cat_features <- c("gender", "dm", "ht")  # Example categorical features
+log_features <- c("a1c", "po4")  # Example log features
+standard_features <- c("age", "Cr")  # Example continuous features
+passthrough_features <- c("key")  # Example passthrough features
+
+# Load and transform data
+base_filename <- "/pydatascience/g3_regress/data/X/X_20240628"
+result <- load_and_transform_data(base_filename, cat_features, log_features, standard_features, passthrough_features)
+
+# Access transformed datasets
+X_train_transformed <- result$X_train_transformed
+X_test_transformed <- result$X_test_transformed
+
